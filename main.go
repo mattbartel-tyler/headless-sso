@@ -3,13 +3,14 @@ package main
 import (
 	"bufio"
 	"context"
-	b64 "encoding/base64"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/fatih/color"
@@ -19,7 +20,6 @@ import (
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/input"
-	"github.com/go-rod/rod/lib/proto"
 )
 
 // Time before MFA step times out
@@ -72,33 +72,82 @@ func getURL() string {
 }
 
 // get aws credentials from netrc file
-func getCredentials() (string, string) {
+func getCredentials() (string, string, error) {
 	spinner.Message("fetching credentials from .netrc")
 
 	usr, _ := user.Current()
 	f, err := netrc.ParseFile(filepath.Join(usr.HomeDir, ".netrc"))
 	if err != nil {
-		panic(".netrc file not found in HOME directory")
+		return "", "", fmt.Errorf(".netrc file not found in HOME directory")
 	}
 
 	username := f.FindMachine("headless-sso", "").Login
 	passphrase := f.FindMachine("headless-sso", "").Password
 
-	return username, passphrase
+	return username, passphrase, nil
+}
+
+func getCredentialsBitwarden() (string, string, error) {
+	item := os.Getenv("AWS_HEADLESS_SSO_BW_SECRET")
+	if len(item) == 0 {
+		return "", "", nil
+	}
+
+	spinner.Message("fetching credentials from bitwarden")
+
+	usernameCmd := exec.Command("bw", "get", "username", item)
+	usernameOut, err := usernameCmd.Output()
+	if err != nil {
+		return "", "", fmt.Errorf("failed getting username from bitwarden: %w", err)
+	}
+	username := strings.TrimSpace(string(usernameOut))
+
+	passwordCmd := exec.Command("bw", "get", "password", item)
+	passwordOut, err := passwordCmd.Output()
+	if err != nil {
+		return "", "", fmt.Errorf("failed getting password from bitwarden: %w", err)
+	}
+	password := strings.TrimSpace(string(passwordOut))
+
+	return username, password, nil
 }
 
 // login with hardware MFA
 func ssoLogin(url string) {
-	username, passphrase := getCredentials()
+	var username, passphrase string
+	var err error
+	if len(os.Getenv("AWS_HEADLESS_SSO_BW_SECRET")) > 0 {
+		if len(os.Getenv("BW_SESSION")) == 0 {
+			logFailureAndExit(`BW_SESSION is not set. Try running 'export BW_SESSION="$(bw login --raw)"'`, url)
+		}
+
+		username, passphrase, err = getCredentialsBitwarden()
+		if err != nil {
+			logFailureAndExit(err.Error(), url)
+		}
+	} else {
+		username, passphrase, err = getCredentials()
+		if err != nil {
+			logFailureAndExit(err.Error(), url)
+		}
+	}
+
 	spinner.Message(color.MagentaString("init headless-browser \n"))
 	spinner.Pause()
+
+	// l := launcher.New().Headless(false).Devtools(true)
+	// defer l.Cleanup()
+	// controlUrl := l.MustLaunch()
+	// browser := rod.New().ControlURL(controlUrl).MustConnect().Trace(false)
+
 	browser := rod.New().MustConnect().Trace(false)
-	loadCookies(*browser)
 	defer browser.MustClose()
-	
-	err := rod.Try(func() {
-		page := browser.MustPage(url)
-		
+
+	var page *rod.Page
+
+	err = rod.Try(func() {
+		page = browser.MustPage(url)
+
 		// authorize
 		spinner.Unpause()
 		spinner.Message("logging in")
@@ -109,33 +158,18 @@ func ssoLogin(url string) {
 		}).Element("#awsui-input-0").MustHandle(func(e *rod.Element) {
 			signIn(*page, username, passphrase)
 			// mfa required step
-			mfa(*page)
+			mfa()
 		}).MustDo()
 
-		// allow request
-		unauthorized := true
-		for unauthorized {
-
-			txt := page.Timeout(MFA_TIMEOUT * time.Second).MustElement(".awsui-util-mb-s").MustWaitLoad().MustText()
-			if txt == "Request approved" {
-				unauthorized = false
-			} else {
-				exists, _, _ := page.HasR("button", "Allow")
-				if exists {
-					page.MustWaitLoad().MustElementR("button", "Allow").MustClick()
-				}
-
-				time.Sleep(500 * time.Millisecond)
-			}
-		}
-
-		saveCookies(*browser)
+		page.Timeout(MFA_TIMEOUT*time.Second).MustElementR("button", "Confirm and continue").MustWaitEnabled().MustClick()
+		page.Timeout(MFA_TIMEOUT*time.Second).MustElementR("button", "Allow access").MustWaitEnabled().MustClick()
+		page.Timeout(MFA_TIMEOUT*time.Second).MustElementR(".awsui-context-alert", "Request approved").MustWaitLoad()
 	})
 
 	if errors.Is(err, context.DeadlineExceeded) {
-		panic("Timed out waiting for MFA")
+		logFailureAndExit("Timed out waiting for MFA", url)
 	} else if err != nil {
-		panic(err.Error())
+		logFailureAndExit(err.Error(), url)
 	}
 }
 
@@ -146,65 +180,21 @@ func signIn(page rod.Page, username, passphrase string) {
 }
 
 // TODO: allow user to enter MFA Code
-func mfa(page rod.Page) {
+func mfa() {
 	_ = beeep.Notify("headless-sso", "Touch U2F device to proceed with authenticating AWS SSO", "")
 	_ = beeep.Beep(beeep.DefaultFreq, beeep.DefaultDuration)
 
 	spinner.Message(color.YellowString("Touch U2F"))
 }
 
-// load cookies
-func loadCookies(browser rod.Browser) {
-	spinner.Message("loading cookies")
-	dirname, err := os.UserHomeDir()
-	if err != nil {
-		error(err.Error())
-	}
-
-	data, _ := os.ReadFile(dirname + "/.headless-sso")
-	sEnc, _ := b64.StdEncoding.DecodeString(string(data))
-	var cookie *proto.NetworkCookie
-	json.Unmarshal(sEnc, &cookie)
-
-	if cookie != nil {
-		browser.MustSetCookies(cookie)
-	}
-}
-
-// save authn cookie
-func saveCookies(browser rod.Browser) {
-	dirname, err := os.UserHomeDir()
-	if err != nil {
-		error(err.Error())
-	}
-
-	cookies := (browser.MustGetCookies())
-
-	for _, cookie := range cookies {
-		if cookie.Name == "x-amz-sso_authn" {
-			data, _ := json.Marshal(cookie)
-
-			sEnc := b64.StdEncoding.EncodeToString([]byte(data))
-			err = os.WriteFile(dirname+"/.headless-sso", []byte(sEnc), 0644)
-
-			if err != nil {
-				error("Failed to save x-amz-sso_authn cookie")
-			}
-			break
-		}
-	}
-}
-
 // print error message and exit
-func panic(errorMsg string) {
-	red := color.New(color.FgRed).SprintFunc()
-	spinner.StopFailMessage(red("Login failed error - " + errorMsg))
+func logFailureAndExit(errorMsg, url string) {
+	spinner.StopFailMessage(color.RedString("Login failed error - " + errorMsg))
 	spinner.StopFail()
-	os.Exit(1)
-}
 
-// print error message
-func error(errorMsg string) {
-	yellow := color.New(color.FgYellow).SprintFunc()
-	spinner.Message("Warn: " + yellow(errorMsg))
+	if len(url) > 0 {
+		fmt.Printf("Try logging in manually at: %s\n", url)
+	}
+
+	os.Exit(1)
 }
