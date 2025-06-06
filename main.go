@@ -118,7 +118,7 @@ func ssoLogin(url string) {
 	var err error
 	if len(os.Getenv("AWS_HEADLESS_SSO_BW_SECRET")) > 0 {
 		if len(os.Getenv("BW_SESSION")) == 0 {
-			logFailureAndExit(`BW_SESSION is not set. Try running 'export BW_SESSION="$(bw login --raw)"'`, url)
+			logFailureAndExit(`BW_SESSION is not set. Try running 'export BW_SESSION="$(bw unlock --raw)"'`, url)
 		}
 
 		username, passphrase, err = getCredentialsBitwarden()
@@ -189,7 +189,7 @@ func mfa() {
 
 // print error message and exit
 func logFailureAndExit(errorMsg, url string) {
-	spinner.StopFailMessage(color.RedString("Login failed error - " + errorMsg))
+	spinner.StopFailMessage(color.RedString("Error - " + errorMsg))
 	spinner.StopFail()
 
 	if len(url) > 0 {
